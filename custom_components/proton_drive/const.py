@@ -8,7 +8,7 @@ DOMAIN = "proton_drive"
 
 CONF_BACKUP_FOLDER = "backup_folder"
 
-CLI_VERSION = "0.5.0"
+CLI_VERSION = "0.9.0"
 
 CLI_BASE_URL_FORMAT: dict[str, str] = {
     "glibc": "https://proton.me/download/drive/cli/{version}/linux-{arch}/proton-drive",
@@ -16,19 +16,19 @@ CLI_BASE_URL_FORMAT: dict[str, str] = {
 }
 CLI_CHECKSUMS: dict[str, str] = {
     "glibc-arm64": (
-        "a679e1e09d29413452a6ac24664dbd249bcafa1fb208e24b9c04133cd97488bf6"
-        "86d350cfcd2522742ac69de428142ac65cb56eb11f25260d3b4ffaa57d39054"
+        "c8d5a6b174e57f06d05cb5483400b9963faf58e743b6b33706bb73ecff718047f"
+        "fce6b439994255b94b5b226b90d2e91bef7418ec96c1c3f5d8bf39b6cd01321"
     ),
     "glibc-x64": (
-        "d85edbc57412c92a9705b70a8d3a5c66ad933331554d6b922b912d6df29b4e5e9"
-        "b0d7a940a594927dd4788e1f8db86d5e9a23f084f07dbd5327f7a9e51d61272"
+        "3533025ba69ae112b64e3e01fbcc1ad0688136a4043f6cf6a72886967d85fdcd9"
+        "ec235479c2e113171614be5225bfba93427509a05ca5aa6071d924fa7e91ca8"
     ),
     "musl-arm64": (
-        "5dea0dffd08bd14570c7c50f1e85221b91312c04b0d6684109f909dcd568050db"
-        "869e48158d93534c619f85e67731e3df4cf467a7ee81350b2f2af8e97a4a171"
+        "4b632e5e694f6d0825aaa57f39f99494aa6a46eac45e90d65daa10b2e46316046"
+        "b627d3c1145cb9c7d58951735cc6e81c28cca44dda648b411315a28d04b2acf"
     ),
     "musl-x64": (
-        "faf5a227b054168eb3a4b4fee3264753976c1848ccab4554203082bc6bfabe455"
-        "bd306c9277d41d5e86104e8b96312ed814aa6ae26a781b59d1d020a27732e61"
+        "8f99c3bc478ebc2948ca69c8576a48d83b3290d807ca61fac9b0f5d0a91c0d418"
+        "e595232d67e2ae0173d2188963771afd4292aefafab3f64e808a61c4399d6ed"
     ),
 }

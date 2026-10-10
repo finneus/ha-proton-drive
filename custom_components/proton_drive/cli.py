@@ -336,7 +336,11 @@ class ProtonCLI:
                 *argv,
                 env={
                     **os.environ,
+                    # Home Assistant has no OS keychain: keep the session in a plain file (read by __get_auth).
+                    # CLI < 0.9 used PROTON_DRIVE_UNSAFE_SECRETS, 0.9+ uses PROTON_DRIVE_CREDENTIALS_STORE
+                    # (keychain | pass | unsafe_file).
                     "PROTON_DRIVE_UNSAFE_SECRETS": "true",
+                    "PROTON_DRIVE_CREDENTIALS_STORE": "unsafe_file",
                     "XDG_CACHE_HOME": self.__xdg,
                     "XDG_DATA_HOME": self.__xdg,
                     "XDG_STATE_HOME": self.__xdg,
