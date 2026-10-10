@@ -109,6 +109,27 @@ def _transform_version(version: AwesomeVersion | None) -> str:
     return f"{version.major or 0}.{version.minor or 0}.{version.patch or 0}-{channel}{suffix}"
 
 
+def _parse_proc_io(text: str) -> tuple[int, int] | None:
+    """Return (rchar, wchar) from the content of /proc/<pid>/io, None if they are missing."""
+    values: dict[str, int] = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        if value.strip().isdigit():
+            values[key.strip()] = int(value)
+    if "rchar" not in values or "wchar" not in values:
+        return None
+    return values["rchar"], values["wchar"]
+
+
+async def _proc_io(pid: int) -> tuple[int, int] | None:
+    """Bytes read/written so far by a process (Linux only), None if unavailable."""
+    try:
+        async with aiofiles.open(f"/proc/{pid}/io") as f:
+            return _parse_proc_io(await f.read())
+    except OSError:
+        return None
+
+
 class ProtonCLI:
     """Wrapper for the Proton Drive CLI binary."""
 
@@ -118,6 +139,8 @@ class ProtonCLI:
     METADATA_TIMEOUT_S = 60
     TRANSFER_TIMEOUT_S = 60 * 60
     TERMINATE_GRACE_S = 5
+    # How often a running transfer is sampled for progress (see run(on_io=...))
+    IO_POLL_INTERVAL_S = 5
 
     STALE_AUTH_THRESHOLD = timedelta(hours=24)
     STALE_AUTH_REQUIRED_SUCCESSES = 5
@@ -371,6 +394,24 @@ class ProtonCLI:
         else:
             LOGGER.debug("[%s] Exited cleanly after SIGTERM", run.id)
 
+    async def __watch_io(self, run: _CLIRun, on_io: Callable[[int], None]) -> None:
+        """
+        Report how far a running transfer got, from the kernel's I/O counters of the CLI process.
+
+        The CLI prints no machine-readable progress when it is not attached to a terminal. While uploading it reads
+        the local file and writes the (encrypted) data to the network, so min(read, written) follows the transfer.
+        Stops quietly where /proc is not available (not Linux) or once the process is gone.
+        """
+        while True:
+            await asyncio.sleep(self.IO_POLL_INTERVAL_S)
+            io = await _proc_io(run.process.pid)
+            if io is None:
+                return
+            try:
+                on_io(min(io))
+            except Exception:  # noqa: BLE001 - a progress callback must never break the transfer
+                LOGGER.debug("[%s] Progress callback failed", run.id, exc_info=True)
+
     def __kill_and_reap(self, run: _CLIRun) -> None:
         # Fire-and-forget: used from the timeout-retry loop, where blocking here would delay
         # the next attempt by up to TERMINATE_GRACE_S for no benefit.
@@ -509,13 +550,20 @@ class ProtonCLI:
         is_json: bool = True,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         retries: int = 3,
+        on_io: Callable[[int], None] | None = None,
     ) -> Any:
-        """Run a CLI command and return the parsed JSON output."""
+        """
+        Run a CLI command and return the parsed JSON output.
+
+        `on_io` (optional) is called every IO_POLL_INTERVAL_S with the bytes the process has both read and written
+        so far - a progress estimate for transfers. It starts again from 0 on a retry.
+        """
         attempt = 0
         uid = uuid4().hex[:8]
         async with self.__serialize_if_auth_stale(uid):
             while True:
                 run = await self.__run(*args, uid=uid)
+                watcher = asyncio.create_task(self.__watch_io(run, on_io)) if on_io is not None else None
                 try:
                     async with asyncio.timeout(timeout_s):
                         stdout, stderr = await run.process.communicate()
@@ -536,6 +584,9 @@ class ProtonCLI:
                     # process). Unlike the timeout path above, blocking here briefly is fine and desired.
                     await asyncio.shield(self.__terminate(run))
                     raise
+                finally:
+                    if watcher is not None:
+                        watcher.cancel()
                 try:
                     return self._process_run(run, stdout, stderr, is_json=is_json)
                 except CLIDatabaseLockedError:

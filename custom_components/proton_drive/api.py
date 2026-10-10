@@ -92,6 +92,26 @@ class Metadata:
         }
 
 
+def _upload_progress(size: int, on_progress: OnProgressCallback) -> Callable[[int], None]:
+    """
+    Turn the bytes the CLI has transferred into Home Assistant upload progress.
+
+    Writing the local archive is the first half of the bar (see upload_backup), the upload the second half. The CLI
+    reports no progress itself, so the transferred bytes are estimated from its I/O counters (ProtonCLI.run(on_io=...)).
+    Never goes backwards (a retry starts again from 0) and stays below 100 % until the upload has really finished.
+    """
+    reported = size // 2
+
+    def _on_io(transferred: int) -> None:
+        nonlocal reported
+        estimate = min(size // 2 + min(transferred, size) // 2, size - 1)
+        if estimate > reported:
+            reported = estimate
+            on_progress(bytes_uploaded=estimate)
+
+    return _on_io
+
+
 class ProtonDriveClient:
     """Client for the Proton Drive API."""
 
@@ -302,7 +322,7 @@ class ProtonDriveClient:
                 time.monotonic() - write_start,
             )
 
-            async def _upload(local_path: Path, timeout_s: float) -> None:
+            async def _upload(local_path: Path, timeout_s: float, on_io: Callable[[int], None] | None = None) -> None:
                 try:
                     await self.__cli.run(
                         "filesystem",
@@ -311,6 +331,7 @@ class ProtonDriveClient:
                         str(self.__backup_folder),
                         timeout_s=timeout_s,
                         retries=2,
+                        on_io=on_io,
                     )
                 except NameConflictError:
                     # A retry of our own timed-out-but-actually-completed attempt: our filenames
@@ -320,10 +341,11 @@ class ProtonDriveClient:
                         local_path.name,
                     )
 
-            # TODO: upload progress feedback is missing
             upload_start = time.monotonic()
             meta_task = asyncio.create_task(_upload(meta_path, ProtonCLI.METADATA_TIMEOUT_S))
-            archive_task = asyncio.create_task(_upload(archive_path, ProtonCLI.TRANSFER_TIMEOUT_S))
+            archive_task = asyncio.create_task(
+                _upload(archive_path, ProtonCLI.TRANSFER_TIMEOUT_S, _upload_progress(size, on_progress))
+            )
             try:
                 await asyncio.gather(meta_task, archive_task)
             except CLIError:
