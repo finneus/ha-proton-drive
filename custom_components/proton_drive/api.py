@@ -404,15 +404,14 @@ class ProtonDriveClient:
         metadata_files = [f for f in files if f.endswith(metadata_suffix)]
         archive_files = [f for f in files if f.endswith(archive_suffix)]
 
+        # Files without their counterpart are only skipped, never trashed automatically: metadata and archive
+        # are uploaded in parallel (the archive can take up to an hour) and Proton Drive lists new files with a
+        # delay, so a backup that is still uploading or was just finished can look "orphaned" for a while.
         file_set = set(files)
         orphans = [f for f in metadata_files if not self.__has_matching_archive(f, files)]
         orphans.extend(f for f in archive_files if f.removesuffix(self.ARCHIVE_EXT) + self.METADATA_EXT not in file_set)
         if orphans:
-            LOGGER.warning("Trashing orphaned backup file(s) with no counterpart: %s", orphans)
-            try:
-                await self.__cli.trash(*map(self.__make_filepath, orphans))
-            except CLIError:
-                LOGGER.exception("Failed to trash orphaned backup files")
+            LOGGER.debug("Skipping backup file(s) without counterpart (uploading, delayed or orphaned): %s", orphans)
 
         live_metadata_files = [f for f in metadata_files if f not in orphans]
 
@@ -454,7 +453,7 @@ class ProtonDriveClient:
                     )
                     async with aiofiles.open(path / metadata_file) as f:
                         data = await f.read()
-            except (CLITimeoutError, NameConflictError):
+            except CLITimeoutError, NameConflictError:
                 if attempt >= attempts:
                     raise
                 LOGGER.debug("Retrying metadata download of %s (%d/%d)", metadata_file, attempt, attempts)
