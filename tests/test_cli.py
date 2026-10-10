@@ -6,12 +6,14 @@ import asyncio
 import json
 import logging
 import os
+import pathlib
 import time
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Self
 
 import aiohttp
 import pytest
+from proton_drive import cli as cli_module
 from proton_drive.cli import APIUnavailableError, AuthError, CLIError, ProtonCLI
 
 if TYPE_CHECKING:
@@ -278,3 +280,69 @@ async def test_api_call_400_stays_cli_error(tmp_path: Path, monkeypatch: pytest.
     with pytest.raises(CLIError) as exc_info:
         await cli.get_email()
     assert type(exc_info.value) is CLIError
+
+
+def test_parse_proc_io() -> None:
+    """Only rchar/wchar are taken from /proc/<pid>/io; missing fields give None."""
+    text = "rchar: 2048\nwchar: 1024\nsyscr: 5\nsyscw: 3\nread_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n"
+    assert cli_module._parse_proc_io(text) == (2048, 1024)
+    assert cli_module._parse_proc_io("syscr: 5\n") is None
+
+
+@pytest.mark.skipif(not pathlib.Path("/proc/self/io").exists(), reason="needs Linux /proc/<pid>/io")
+async def test_on_io_reports_transfer_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A process that reads a file and writes it out must be reported with at least the file size."""
+    data = tmp_path / "archive.tar"
+    data.write_bytes(os.urandom(2 * 1024 * 1024))
+    script = tmp_path / "copy_then_wait.py"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, time\n"
+        "src = open(sys.argv[1], 'rb').read()\n"
+        "with open('/dev/null', 'wb') as out:\n"
+        "    out.write(src)\n"
+        "time.sleep(1)\n"
+    )
+    script.chmod(0o700)
+    monkeypatch.setattr(ProtonCLI, "IO_POLL_INTERVAL_S", 0.1)
+    cli = make_cli(script, xdg=tmp_path)
+    seen: list[int] = []
+
+    await cli.run(str(data), is_json=False, timeout_s=10, retries=0, on_io=seen.append)
+
+    assert seen, "on_io was never called"
+    assert max(seen) >= data.stat().st_size
+
+
+async def test_on_io_callback_errors_do_not_break_the_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failing progress callback must not affect the command itself."""
+    script = write_sleep_maybe_fail_mock(tmp_path)
+    monkeypatch.setattr(ProtonCLI, "IO_POLL_INTERVAL_S", 0.05)
+
+    async def fake_proc_io(_pid: int) -> tuple[int, int]:
+        return (10, 20)
+
+    monkeypatch.setattr(cli_module, "_proc_io", fake_proc_io)
+    cli = make_cli(script, xdg=tmp_path)
+
+    def broken(_transferred: int) -> None:
+        raise RuntimeError
+
+    assert await cli.run("0.3", "ok", is_json=False, timeout_s=5, retries=0, on_io=broken) is None
+
+
+async def test_on_io_stops_without_proc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without /proc (not Linux) the watcher ends quietly and the callback is never called."""
+    script = write_sleep_maybe_fail_mock(tmp_path)
+    monkeypatch.setattr(ProtonCLI, "IO_POLL_INTERVAL_S", 0.05)
+
+    async def no_proc_io(_pid: int) -> None:
+        return None
+
+    monkeypatch.setattr(cli_module, "_proc_io", no_proc_io)
+    cli = make_cli(script, xdg=tmp_path)
+    seen: list[int] = []
+
+    await cli.run("0.3", "ok", is_json=False, timeout_s=5, retries=0, on_io=seen.append)
+
+    assert seen == []
