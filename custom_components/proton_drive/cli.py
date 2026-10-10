@@ -399,16 +399,20 @@ class ProtonCLI:
         Report how far a running transfer got, from the kernel's I/O counters of the CLI process.
 
         The CLI prints no machine-readable progress when it is not attached to a terminal. While uploading it reads
-        the local file and writes the (encrypted) data to the network, so min(read, written) follows the transfer.
-        Stops quietly where /proc is not available (not Linux) or once the process is gone.
+        the local file block by block (with backpressure from the upload), which shows up in `rchar`. `wchar` does
+        not help: the CLI sends over the network with send(), which the kernel does not count there (measured with
+        CLI 0.9.0: ~600 KB of wchar for a 1.26 GB upload). Stops quietly where /proc is not available (not Linux) or
+        once the process is gone.
         """
         while True:
             await asyncio.sleep(self.IO_POLL_INTERVAL_S)
             io = await _proc_io(run.process.pid)
             if io is None:
                 return
+            read, written = io
+            LOGGER.debug("[%s] CLI I/O so far: read=%d written=%d", run.id, read, written)
             try:
-                on_io(min(io))
+                on_io(read)
             except Exception:  # noqa: BLE001 - a progress callback must never break the transfer
                 LOGGER.debug("[%s] Progress callback failed", run.id, exc_info=True)
 
@@ -555,8 +559,8 @@ class ProtonCLI:
         """
         Run a CLI command and return the parsed JSON output.
 
-        `on_io` (optional) is called every IO_POLL_INTERVAL_S with the bytes the process has both read and written
-        so far - a progress estimate for transfers. It starts again from 0 on a retry.
+        `on_io` (optional) is called every IO_POLL_INTERVAL_S with the bytes the process has read so far - a progress
+        estimate for uploads. It starts again from 0 on a retry.
         """
         attempt = 0
         uid = uuid4().hex[:8]
