@@ -214,22 +214,19 @@ class ProtonCLI:
         LOGGER.debug("Checking for cached Proton Drive CLI at %s", cached)
 
         if await aiofiles.ospath.exists(cached) and not await self.__is_valid(cached):
-            LOGGER.info("Cached Proton Drive CLI is invalid, redownloading")
+            LOGGER.info("Replacing cached Proton Drive CLI with version %s", CLI_VERSION)
             await aiofiles.os.unlink(cached)
 
         if not await aiofiles.ospath.exists(cached):
             await self.__download(hass, cached)
 
         try:
-            cli_version = await self.run("version", is_json=False)
+            # Only checks that the binary runs: with --json (always added) `version` prints nothing. The version
+            # itself is pinned by the checksum verified above.
+            await self.run("version", is_json=False)
         except CLIError as e:
             raise CLIStartupError(str(e)) from e
-        LOGGER.info(
-            "Proton Drive CLI ready: integration=%s, cli=%s (expected %s)",
-            self.__integration_version,
-            cli_version,
-            CLI_VERSION,
-        )
+        LOGGER.info("Proton Drive CLI %s ready (integration %s)", CLI_VERSION, self.__integration_version)
 
     @classmethod
     async def __get_platform(cls) -> tuple[str, str]:
@@ -297,6 +294,10 @@ class ProtonCLI:
         variant, arch = await self.__get_platform()
         try:
             await self.__verify_checksum(path, variant, arch)
+        except DownloadCLIError:
+            # Expected after an update of CLI_VERSION: the cached binary is the previous version.
+            LOGGER.info("Cached Proton Drive CLI does not match version %s (checksum differs)", CLI_VERSION)
+            return False
         except CLIStartupError:
             LOGGER.exception("Failed to verify checksum for %s", path)
             return False
