@@ -94,18 +94,22 @@ class Metadata:
 
 def _upload_progress(size: int, on_progress: OnProgressCallback) -> Callable[[int], None]:
     """
-    Turn the bytes the CLI has transferred into Home Assistant upload progress.
+    Turn the bytes the CLI has read into Home Assistant upload progress.
 
     Writing the local archive is the first half of the bar (see upload_backup), the upload the second half. The CLI
-    reports no progress itself, so the uploaded bytes are estimated from what it has read of the archive so far
-    (kernel I/O counters, see ProtonCLI.run(on_io=...)).
+    reports no progress itself, so it is estimated from what the CLI process has read (kernel I/O counters, see
+    ProtonCLI.run(on_io=...)). Measured with CLI 0.9.0 in Home Assistant (1.26 GB backup): the CLI first reads the
+    whole file within seconds (content hash), then reads it a second time while uploading, in blocks of ~60 MB with
+    backpressure; in total 2 x size + ~0.4 MB. So the upload progress is `read - size`. While `read` is still below
+    the file size (hashing, or a future CLI without that pass) no upload progress is claimed at all.
     Never goes backwards (a retry starts again from 0) and stays below 100 % until the upload has really finished.
     """
     reported = size // 2
 
-    def _on_io(transferred: int) -> None:
+    def _on_io(read: int) -> None:
         nonlocal reported
-        estimate = min(size // 2 + min(transferred, size) // 2, size - 1)
+        uploaded = min(max(read - size, 0), size)
+        estimate = min(size // 2 + uploaded // 2, size - 1)
         if estimate > reported:
             reported = estimate
             on_progress(bytes_uploaded=estimate)

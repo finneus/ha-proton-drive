@@ -399,10 +399,10 @@ class ProtonCLI:
         Report how far a running transfer got, from the kernel's I/O counters of the CLI process.
 
         The CLI prints no machine-readable progress when it is not attached to a terminal. While uploading it reads
-        the local file block by block (with backpressure from the upload), which shows up in `rchar`. `wchar` does
-        not help: the CLI sends over the network with send(), which the kernel does not count there (measured with
-        CLI 0.9.0: ~600 KB of wchar for a 1.26 GB upload). Stops quietly where /proc is not available (not Linux) or
-        once the process is gone.
+        the local file block by block (with backpressure from the upload), which shows up in `rchar` (how that maps
+        to upload progress: api._upload_progress). `wchar` does not help: the CLI sends over the network with send(),
+        which the kernel does not count there (measured with CLI 0.9.0: ~1.2 MB of wchar for a 1.26 GB upload).
+        Stops quietly where /proc is not available (not Linux) or once the process is gone.
         """
         while True:
             await asyncio.sleep(self.IO_POLL_INTERVAL_S)
