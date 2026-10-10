@@ -2,6 +2,15 @@
 
 **Disclaimer: This is a third-party application not officially supported by Proton.**
 
+> **Fork** of [LouisBrunner/ha-proton-drive](https://github.com/LouisBrunner/ha-proton-drive) (MPL-2.0) with:
+> - Proton Drive CLI **0.9.0** (upstream pins 0.5.0) incl. the new `PROTON_DRIVE_CREDENTIALS_STORE` setting
+> - the upload/locking/cleanup fixes from [upstream PR #144](https://github.com/LouisBrunner/ha-proton-drive/pull/144),
+>   except automatic trashing of "orphaned" files (they are only skipped, see commit history)
+> - regular (non pre-release) versions, so HACS offers updates without enabling beta
+>
+> Changes are offered back upstream where they make sense. Install via HACS custom repository
+> `https://github.com/finneus/ha-proton-drive`.
+
 Proton Drive integration for Home Assistant (compatible with HACS).
 
 ## Installation
