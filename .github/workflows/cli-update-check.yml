@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+# Fork: weekly check whether Proton published a newer Proton Drive CLI than CLI_VERSION in const.py.
+# Opens one issue per new version (checksums are on the same page) - nothing is changed automatically.
+name: CLI update check
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions: {}
+
+jobs:
+  check:
+    name: Compare with proton.me
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compare versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          current=$(sed -n 's/^CLI_VERSION = "\(.*\)"$/\1/p' custom_components/proton_drive/const.py)
+          latest=$(curl -fsSL https://proton.me/download/drive/cli/index.html \
+            | sed -n 's/.*<h1>Proton Drive CLI \([0-9][0-9.]*\)<\/h1>.*/\1/p' | head -1)
+          echo "pinned: ${current:-?}  latest: ${latest:-?}"
+          if [ -z "$current" ] || [ -z "$latest" ]; then
+            echo "::error::could not determine versions (page layout changed?)"
+            exit 1
+          fi
+          if [ "$current" = "$latest" ]; then
+            exit 0
+          fi
+          title="Proton Drive CLI $latest available (pinned: $current)"
+          if gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number --jq 'length' | grep -qx 0; then
+            gh issue create --repo "$REPO" --title "$title" --body "Proton published CLI $latest: https://proton.me/download/drive/cli/index.html
+
+          To update: set CLI_VERSION and the four linux checksums (glibc/musl x arm64/x64) in const.py from that page, compare
+          the commands/env variables used by cli.py with the new binary (see commit history of the 0.9.0 update), run CI and
+          test a backup in Home Assistant before releasing."
+          fi
