@@ -14,14 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint:
-    uses: LouisBrunner/.github/.github/workflows/lint-all.yml@main
-    permissions:
-      actions: read
-      contents: read
-      statuses: write
-      pull-requests: write
-
+  # Fork: the upstream super-linter job (LouisBrunner/.github lint-all.yml@main) is not used here - it pulls a
+  # workflow from a third-party repo at @main and lints with its own ruff rules instead of the project's.
+  # The project's own checks (ruff, ty, pytest) run in "vet" below; hassfest + HACS run in validate.yml.
   vet:
     name: Vet
     runs-on: ubuntu-24.04
