@@ -291,18 +291,11 @@ def test_parse_proc_io() -> None:
 
 @pytest.mark.skipif(not pathlib.Path("/proc/self/io").exists(), reason="needs Linux /proc/<pid>/io")
 async def test_on_io_reports_transfer_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A process that reads a file and writes it out must be reported with at least the file size."""
+    """A process that reads a file must be reported with at least the file size (bytes read, rchar)."""
     data = tmp_path / "archive.tar"
     data.write_bytes(os.urandom(2 * 1024 * 1024))
-    script = tmp_path / "copy_then_wait.py"
-    script.write_text(
-        "#!/usr/bin/env python3\n"
-        "import sys, time\n"
-        "src = open(sys.argv[1], 'rb').read()\n"
-        "with open('/dev/null', 'wb') as out:\n"
-        "    out.write(src)\n"
-        "time.sleep(1)\n"
-    )
+    script = tmp_path / "read_then_wait.py"
+    script.write_text("#!/usr/bin/env python3\nimport sys, time\nsrc = open(sys.argv[1], 'rb').read()\ntime.sleep(1)\n")
     script.chmod(0o700)
     monkeypatch.setattr(ProtonCLI, "IO_POLL_INTERVAL_S", 0.1)
     cli = make_cli(script, xdg=tmp_path)

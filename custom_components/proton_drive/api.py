@@ -97,7 +97,8 @@ def _upload_progress(size: int, on_progress: OnProgressCallback) -> Callable[[in
     Turn the bytes the CLI has transferred into Home Assistant upload progress.
 
     Writing the local archive is the first half of the bar (see upload_backup), the upload the second half. The CLI
-    reports no progress itself, so the transferred bytes are estimated from its I/O counters (ProtonCLI.run(on_io=...)).
+    reports no progress itself, so the uploaded bytes are estimated from what it has read of the archive so far
+    (kernel I/O counters, see ProtonCLI.run(on_io=...)).
     Never goes backwards (a retry starts again from 0) and stays below 100 % until the upload has really finished.
     """
     reported = size // 2
