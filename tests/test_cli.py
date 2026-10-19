@@ -17,6 +17,7 @@ from proton_drive import cli as cli_module
 from proton_drive.cli import APIUnavailableError, AuthError, CLIError, ProtonCLI
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
     from pathlib import Path
 
 CALL_DURATION_S = 0.3
@@ -339,3 +340,108 @@ async def test_on_io_stops_without_proc(tmp_path: Path, monkeypatch: pytest.Monk
     await cli.run("0.3", "ok", is_json=False, timeout_s=5, retries=0, on_io=seen.append)
 
     assert seen == []
+
+
+# --- Download der CLI, Auth-Flow, Ausgabe-Dekodierung ----------------------------------------------------------
+
+
+class _BrokenBody:
+    """Response body that delivers one chunk and then loses the connection."""
+
+    async def iter_chunked(self, _size: int) -> AsyncIterator[bytes]:
+        yield b"partial"
+        msg = "connection lost"
+        raise aiohttp.ClientError(msg)
+
+
+class _BrokenResponse:
+    content = _BrokenBody()
+
+    def raise_for_status(self) -> None:
+        return
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return
+
+
+class _BrokenDownloadSession:
+    def get(self, _url: str) -> _BrokenResponse:
+        return _BrokenResponse()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return
+
+
+async def test_download_network_failure_is_retryable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dropped connection mid-download is a network error (setup is retried), not a permanent startup error."""
+
+    async def platform_() -> tuple[str, str]:
+        return "glibc", "x64"
+
+    monkeypatch.setattr(ProtonCLI, "_ProtonCLI__http_session", classmethod(lambda _cls: _BrokenDownloadSession()))
+    monkeypatch.setattr(ProtonCLI, "_ProtonCLI__get_platform", classmethod(lambda _cls: platform_()))
+    dest = tmp_path / "proton-drive"
+
+    with pytest.raises(cli_module.DownloadCLINetworkError):
+        await ProtonCLI._ProtonCLI__download(None, dest)
+
+    assert not dest.exists()
+    assert not dest.with_suffix(".tmp").exists()
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def _wait_dead(pid: int, timeout_s: float = 5) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+async def test_auth_flow_failure_to_start_does_not_leak_the_process(tmp_path: Path) -> None:
+    """If the CLI's first line is unusable, `auth login` must not be left running in the background."""
+    pidfile = tmp_path / "pid"
+    mock = write_mock(tmp_path, "login.sh", f"echo $$ > {pidfile}; echo garbage; sleep 30")
+    cli = make_cli(mock)
+
+    with pytest.raises(CLIError):
+        await cli.start_auth_flow()
+
+    assert await _wait_dead(int(pidfile.read_text()))
+
+
+async def test_auth_flow_timeout_terminates_the_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the user never finishes the login, the timed-out `auth login` process must be stopped."""
+    pidfile = tmp_path / "pid"
+    mock = write_mock(tmp_path, "login.sh", f'echo $$ > {pidfile}; echo \'{{"signInUrl": "https://x"}}\'; sleep 30')
+    monkeypatch.setattr(ProtonCLI.AuthFlow, "FLOW_TIMEOUT", 0.5)
+    cli = make_cli(mock)
+
+    flow = await cli.start_auth_flow()
+    with pytest.raises(CLIError):
+        await flow.task()
+
+    assert await _wait_dead(int(pidfile.read_text()))
+
+
+async def test_non_utf8_output_does_not_crash(tmp_path: Path) -> None:
+    """Output that is not valid UTF-8 (e.g. a file name) must surface as a CLIError, not a UnicodeDecodeError."""
+    mock = write_mock(tmp_path, "bad.sh", "printf 'bad \\377 name' >&2; exit 1")
+    cli = make_cli(mock)
+
+    with pytest.raises(CLIError):
+        await cli.run("x", retries=0)

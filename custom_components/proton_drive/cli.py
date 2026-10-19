@@ -8,7 +8,7 @@ import json
 import os
 import platform
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import timedelta
 from http import HTTPStatus
@@ -128,6 +128,13 @@ async def _proc_io(pid: int) -> tuple[int, int] | None:
             return _parse_proc_io(await f.read())
     except OSError:
         return None
+
+
+def stop_process(run: ProtonCLI._CLIRun) -> None:
+    """Ask a still-running CLI process to exit (no-op once it is gone)."""
+    if run.process.returncode is None:
+        with suppress(ProcessLookupError):
+            run.process.terminate()
 
 
 class ProtonCLI:
@@ -290,6 +297,9 @@ class ProtonCLI:
                 except Exception as e:
                     if await aiofiles.ospath.exists(tmp_path):
                         await aiofiles.os.unlink(tmp_path)
+                    if isinstance(e, aiohttp.ClientError | TimeoutError):
+                        # connection lost mid-body: transient, reported as a network error below
+                        raise
                     msg = "Failed to write Proton Drive CLI to disk"
                     raise DownloadCLIError(msg) from e
         except (aiohttp.ClientError, TimeoutError) as e:
@@ -611,8 +621,8 @@ class ProtonCLI:
     @classmethod
     def _process_run(cls, run: _CLIRun, stdout: bytes, stderr: bytes, *, is_json: bool = True) -> Any:
         if run.process.returncode != 0:
-            stdout_text = stdout.decode()
-            stderr_text = stderr.decode()
+            stdout_text = stdout.decode(errors="replace")
+            stderr_text = stderr.decode(errors="replace")
 
             is_db_locked = "SQLITE_BUSY" in stdout_text or "SQLITE_BUSY" in stderr_text
             is_name_conflict = "Name conflict on" in stdout_text and "already exists" in stdout_text
@@ -648,11 +658,11 @@ class ProtonCLI:
             "[%s] CLI Result %d: stdout=%s, stderr=%s",
             run.id,
             run.process.returncode,
-            stdout.decode(),
-            stderr.decode(),
+            stdout.decode(errors="replace"),
+            stderr.decode(errors="replace"),
         )
 
-        json_output = stdout.decode().strip()
+        json_output = stdout.decode(errors="replace").strip()
         if not json_output:
             return None
 
@@ -707,6 +717,9 @@ class ProtonCLI:
             except TimeoutError as e:
                 msg = "Auth flow timed out"
                 raise CLIError(msg) from e
+            finally:
+                # timeout or cancelled flow: do not leave `auth login` waiting for a browser nobody uses
+                stop_process(run)
 
             return ProtonCLI._process_run(run, stdout_res, stderr_res)
 
@@ -736,4 +749,9 @@ class ProtonCLI:
                 msg = "Missing 'signInUrl' in CLI output"
                 raise InvalidOutputError(msg) from e
 
-        return self.AuthFlow(url=await _read_url(run), run=run)
+        try:
+            url = await _read_url(run)
+        except BaseException:
+            stop_process(run)
+            raise
+        return self.AuthFlow(url=url, run=run)
