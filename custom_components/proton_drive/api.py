@@ -217,13 +217,13 @@ class ProtonDriveClient:
             name = (
                 self.__make_backup_filename(metadata.base_name, backup_id)
                 if isinstance(metadata, Metadata)
-                else f"${metadata_file.removesuffix(self.METADATA_EXT)}{self.ARCHIVE_EXT}"
+                else f"{metadata_file.removesuffix(self.METADATA_EXT)}{self.ARCHIVE_EXT}"
             )
             LOGGER.debug("Downloading single backup file: %s", name)
             files = [name]
         else:
             files = [self.__make_chunk_filename(metadata.base_name, backup_id, i) for i in range(metadata.chunks)]
-            LOGGER.debug("Downloading chunked (%d chunks) backup file")
+            LOGGER.debug("Downloading chunked (%d chunks) backup file", len(files))
 
         async with self.__temp_folder() as path:
             async for chunk in self.__stream_files(path, files):
@@ -253,28 +253,34 @@ class ProtonDriveClient:
             LOGGER.debug("Downloaded file %d/%d: %s", i + 1, len(files), name)
             return path / name
 
-        while next_i < min(self.DOWNLOAD_WINDOW, len(files)):
-            LOGGER.debug("Scheduling download for file %d/%d: %s", next_i + 1, len(files), files[next_i])
-            tasks[next_i] = asyncio.create_task(download(next_i))
-            next_i += 1
-
-        for i, name in enumerate(files):
-            p = await tasks[i]
-            if isinstance(p, CLIError):
-                msg = f"Failed to download backup file {name}: {p}"
-                raise ProtonDriveError(msg) from p
-
-            if next_i < len(files):
+        try:
+            while next_i < min(self.DOWNLOAD_WINDOW, len(files)):
                 LOGGER.debug("Scheduling download for file %d/%d: %s", next_i + 1, len(files), files[next_i])
                 tasks[next_i] = asyncio.create_task(download(next_i))
                 next_i += 1
 
-            LOGGER.debug("Yielding file %d/%d: %s", i + 1, len(files), name)
-            async with aiofiles.open(p, "rb") as f:
-                while chunk := await f.read(self.READ_CHUNK):
-                    # LOGGER.debug("Yielding chunk of size %d from file %s", len(chunk), name)  # noqa: ERA001
-                    yield chunk
-            LOGGER.debug("Finished yielding file %d/%d: %s", i + 1, len(files), name)
+            for i, name in enumerate(files):
+                p = await tasks[i]
+                if isinstance(p, CLIError):
+                    msg = f"Failed to download backup file {name}: {p}"
+                    raise ProtonDriveError(msg) from p
+
+                if next_i < len(files):
+                    LOGGER.debug("Scheduling download for file %d/%d: %s", next_i + 1, len(files), files[next_i])
+                    tasks[next_i] = asyncio.create_task(download(next_i))
+                    next_i += 1
+
+                LOGGER.debug("Yielding file %d/%d: %s", i + 1, len(files), name)
+                async with aiofiles.open(p, "rb") as f:
+                    while chunk := await f.read(self.READ_CHUNK):
+                        yield chunk
+                LOGGER.debug("Finished yielding file %d/%d: %s", i + 1, len(files), name)
+        finally:
+            # On a failure (or an abandoned stream) the read-ahead downloads must not keep running against the temp
+            # folder the caller removes right after this generator ends.
+            for task in tasks.values():
+                task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
 
     async def upload_backup(
         self,
@@ -448,7 +454,8 @@ class ProtonDriveClient:
                 if isinstance(metadata, Metadata):
                     return AgentBackup.from_dict(metadata.metadata)
                 return AgentBackup.from_dict(metadata)
-            except CLIError:
+            except CLIError, ProtonDriveInvalidBackupError, KeyError, TypeError, ValueError:
+                # One unreadable/incomplete metadata file must not hide all the other backups
                 LOGGER.exception("Failed to read metadata %s", filename)
                 return None
 
