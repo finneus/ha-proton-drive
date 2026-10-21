@@ -389,20 +389,7 @@ class ProtonDriveClient:
                         on_io=on_io,
                     )
                 except NameConflictError:
-                    # A retry after our own timed-out attempt: our filenames embed the backup_id, so the file is
-                    # ours - but that attempt may have stopped half-way. Only a complete file counts as uploaded.
-                    expected = (await aiofiles.os.stat(local_path)).st_size
-                    actual = await self.__remote_size(self.__make_filepath(local_path.name))
-                    if actual != expected:
-                        msg = (
-                            f"{local_path.name} already exists in Proton Drive but is incomplete "
-                            f"({actual} of {expected} bytes) after an interrupted attempt"
-                        )
-                        raise CLIError(msg) from None
-                    LOGGER.info(
-                        "Upload of %s already completed (name conflict on retry, size verified), treating as success",
-                        local_path.name,
-                    )
+                    await self.__verify_existing_upload(local_path)
 
             upload_start = time.monotonic()
             meta_task = asyncio.create_task(_upload(meta_path, ProtonCLI.METADATA_TIMEOUT_S))
@@ -531,6 +518,26 @@ class ProtonDriveClient:
             return None
         metadata = await self.__read_metadata(metadata_file)
         return AgentBackup.from_dict(metadata.metadata if isinstance(metadata, Metadata) else metadata)
+
+    async def __verify_existing_upload(self, local_path: Path) -> None:
+        """
+        Accept a name conflict on upload only for a complete file.
+
+        A retry after our own timed-out attempt: our filenames embed the backup_id, so the file is ours - but that
+        attempt may have stopped half-way. Raises CLIError (-> cleanup) if the remote file is not the full size.
+        """
+        expected = (await aiofiles.os.stat(local_path)).st_size
+        actual = await self.__remote_size(self.__make_filepath(local_path.name))
+        if actual != expected:
+            msg = (
+                f"{local_path.name} already exists in Proton Drive but is incomplete "
+                f"({actual} of {expected} bytes) after an interrupted attempt"
+            )
+            raise CLIError(msg)
+        LOGGER.info(
+            "Upload of %s already completed (name conflict on retry, size verified), treating as success",
+            local_path.name,
+        )
 
     async def __remote_size(self, path: str) -> int | None:
         """Size of a file in the drive (raw, from its active revision), None if unknown or not there."""
