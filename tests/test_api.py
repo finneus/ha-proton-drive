@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
 from proton_drive import api as api_module
-from proton_drive.api import ProtonDriveClient, ProtonDriveError, ProtonDriveInvalidBackupError, _upload_progress
-from proton_drive.cli import CLIError
+from proton_drive.api import (
+    Metadata,
+    ProtonDriveClient,
+    ProtonDriveError,
+    ProtonDriveInvalidBackupError,
+    _upload_progress,
+    normalize_backup_folder,
+)
+from proton_drive.cli import CLIError, NameConflictError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -145,3 +153,130 @@ async def test_stream_files_cancels_pending_downloads_on_failure(tmp_path: Path)
         _ = [chunk async for chunk in stream]
 
     assert sorted(cancelled) == ["a.tar", "b.tar"]
+
+
+# --- Review 2026-10-19: remaining points --------------------------------------------------------------------------
+
+
+def _metadata(**changes: object) -> dict:
+    data = {
+        "proton_drive_version": "1.0.0",
+        "instance_id": "inst",
+        "backup_id": "b1",
+        "base_name": "Home_Assistant_2026-10-21",
+        "metadata": {},
+        "chunks": 1,
+    }
+    return {**data, **changes}
+
+
+@pytest.mark.parametrize("base_name", ["../x", "a/b", "a\\b", "nul\0"])
+def test_metadata_rejects_base_name_with_path_separators(base_name: str) -> None:
+    """`base_name` from the drive ends up in local paths: a separator would leave the temp folder."""
+    with pytest.raises(ProtonDriveInvalidBackupError):
+        Metadata.load(_metadata(base_name=base_name))
+
+
+@pytest.mark.parametrize("chunks", [0, -1, 10**9, True, "3", 2.5])
+def test_metadata_rejects_odd_chunk_counts(chunks: object) -> None:
+    """A huge or non-integer `chunks` would build huge lists or crash later."""
+    with pytest.raises(ProtonDriveInvalidBackupError):
+        Metadata.load(_metadata(chunks=chunks))
+
+
+def test_metadata_accepts_normal_values() -> None:
+    loaded = Metadata.load(_metadata(chunks=3))
+    assert isinstance(loaded, Metadata)
+    assert loaded.chunks == 3  # noqa: PLR2004
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("/my-files/HomeAssistant", "/my-files/HomeAssistant"),
+        (" /my-files//HA/ ", "/my-files/HA"),
+        ("/my-files/./HA", "/my-files/HA"),
+        ("/my-files", None),
+        ("my-files/HA", None),
+        ("/my-files/../x", None),
+        ("/my-files/-rf", None),
+    ],
+)
+def test_normalize_backup_folder(raw: str, expected: str | None) -> None:
+    result = normalize_backup_folder(raw)
+    assert (result.as_posix() if result else None) == expected
+
+
+class StatCLI(FakeCLI):
+    """FakeCLI whose upload always reports a name conflict and whose `stat` reports a fixed remote size."""
+
+    def __init__(self, remote_sizes: dict[str, int | None]) -> None:
+        """Remember the remote size per file name (None = no size known)."""
+        super().__init__([], self._run)
+        self.remote_sizes = remote_sizes
+        self.trashed: list[str] = []
+
+    async def _run(self, *args: str, **_kwargs: object) -> None:
+        if args[:2] == ("filesystem", "upload"):
+            msg = "Name conflict on upload, already exists"
+            raise NameConflictError(msg)
+
+    async def stat(self, path: str) -> object:
+        """Mimic `filesystem info`: the size is in activeRevision.claimedSize."""
+        size = self.remote_sizes.get(Path(path).name.split(".", 1)[-1])
+        return SimpleNamespace(activeRevision=SimpleNamespace(claimedSize=size))
+
+    async def exists(self, _path: str) -> bool:
+        """Every file exists (for the cleanup after a failure)."""
+        return True
+
+    async def trash(self, *files: str) -> None:
+        """Record what the cleanup trashes."""
+        self.trashed.extend(files)
+
+
+async def _upload(client: ProtonDriveClient, monkeypatch: pytest.MonkeyPatch, data: bytes) -> None:
+    backup = SimpleNamespace(backup_id="b1", as_dict=dict)
+    monkeypatch.setattr(api_module, "suggested_filename", lambda _backup: "HA.tar")
+
+    async def open_stream() -> AsyncIterator[bytes]:
+        async def gen() -> AsyncIterator[bytes]:
+            yield data
+
+        return gen()
+
+    await client.upload_backup(open_stream, backup, on_progress=lambda **_kwargs: None)
+
+
+async def test_name_conflict_counts_only_with_matching_size(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A retry hitting our own name: success only if the earlier attempt really uploaded the whole file."""
+    data = b"x" * 100
+    meta_size = None  # set below once the metadata file size is known
+
+    cli = StatCLI({"tar": len(data), "metadata.json": meta_size})
+    client = make_client(tmp_path, cli)
+
+    real_stat = api_module.aiofiles.os.stat
+
+    async def stat(path: Path) -> object:
+        result = await real_stat(path)
+        if str(path).endswith(".metadata.json"):
+            cli.remote_sizes["metadata.json"] = result.st_size
+        return result
+
+    monkeypatch.setattr(api_module.aiofiles.os, "stat", stat)
+    await _upload(client, monkeypatch, data)
+    assert cli.trashed == []
+
+
+async def test_name_conflict_with_incomplete_file_fails_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Upload stopped at 60 %, the retry hit a name conflict: before, this was reported as a successful backup."""
+    data = b"x" * 100
+    cli = StatCLI({"tar": 60, "metadata.json": None})
+    client = make_client(tmp_path, cli)
+
+    with pytest.raises(CLIError, match="incomplete"):
+        await _upload(client, monkeypatch, data)
+    assert cli.trashed  # partial files go to the trash

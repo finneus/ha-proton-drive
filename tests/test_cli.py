@@ -69,7 +69,7 @@ def make_cli(binary_path: Path, *, xdg: Path | None = None, shared_critical: boo
         "_ProtonCLI__path": str(binary_path),
         "_ProtonCLI__xdg": str(xdg) if xdg is not None else "/tmp",  # noqa: S108
         "_ProtonCLI__integration_version": "test",
-        "_ProtonCLI__reap_tasks": set(),
+        "_ProtonCLI__reaping": {},
     }
     if not shared_critical:
         attrs["_ProtonCLI__critical"] = ProtonCLI._CriticalState()
@@ -445,3 +445,49 @@ async def test_non_utf8_output_does_not_crash(tmp_path: Path) -> None:
 
     with pytest.raises(CLIError):
         await cli.run("x", retries=0)
+
+
+# --- Review 2026-10-19: remaining points --------------------------------------------------------------------------
+
+
+def test_cli_env_keeps_secrets_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SUPERVISOR_TOKEN and other variables of Home Assistant must not reach the downloaded binary."""
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "geheim")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy:3128")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    env = cli_module._cli_env({"XDG_CACHE_HOME": "/x"})
+    assert "SUPERVISOR_TOKEN" not in env
+    assert env["HTTPS_PROXY"] == "http://proxy:3128"
+    assert env["PATH"] == "/usr/bin"
+    assert env["XDG_CACHE_HOME"] == "/x"
+
+
+async def test_cli_process_does_not_see_supervisor_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUPERVISOR_TOKEN", "geheim")
+    binary = write_mock(tmp_path, "env", 'printf "{\\"token\\": \\"%s\\"}" "${SUPERVISOR_TOKEN:-}"')
+    result = await make_cli(binary).run("env")
+    assert result.token == ""
+
+
+def test_sha512_file_matches_hashlib(tmp_path: Path) -> None:
+    import hashlib  # noqa: PLC0415
+
+    path = tmp_path / "bin"
+    data = os.urandom(3 * cli_module._HASH_BLOCK + 17)
+    path.write_bytes(data)
+    assert cli_module._sha512_file(path) == hashlib.sha512(data).hexdigest()
+
+
+async def test_timeout_retry_waits_for_the_old_process(tmp_path: Path) -> None:
+    """A retry must not start while the timed-out attempt (e.g. a half-done upload) is still running."""
+    marker = tmp_path / "runs"
+    binary = write_mock(
+        tmp_path,
+        "slow",
+        f'echo start >> "{marker}"; trap "echo stop >> {marker}; exit 1" TERM; sleep 30 & wait',
+    )
+    cli = make_cli(binary)
+    with pytest.raises(cli_module.CLITimeoutError):
+        await cli.run("slow", timeout_s=0.5, retries=1)
+    lines = marker.read_text().split()
+    assert lines[:3] == ["start", "stop", "start"]

@@ -56,6 +56,9 @@ class Metadata:
     metadata: dict  # AgentBackup.as_dict()
     chunks: int
 
+    # Upper bound for `chunks` read from the drive (a backup this size would be > 1 TB with today's chunking)
+    MAX_CHUNKS: ClassVar[int] = 10_000
+
     @classmethod
     def is_valid(cls, data: dict) -> bool:
         """Check if the given JSON string is valid metadata."""
@@ -71,6 +74,15 @@ class Metadata:
         """
         if not cls.is_valid(data):
             return data
+        # The metadata comes from the drive: whoever can write there must not be able to steer local paths
+        # (`base_name` ends up in `temp_dir / name`) or make us build huge lists (`chunks`).
+        base_name, chunks = data["base_name"], data["chunks"]
+        if not isinstance(base_name, str) or any(c in base_name for c in "/\\\0"):
+            msg = f"Invalid base_name in backup metadata: {base_name!r}"
+            raise ProtonDriveInvalidBackupError(msg)
+        if isinstance(chunks, bool) or not isinstance(chunks, int) or not 1 <= chunks <= cls.MAX_CHUNKS:
+            msg = f"Invalid chunk count in backup metadata: {chunks!r}"
+            raise ProtonDriveInvalidBackupError(msg)
         return cls(
             proton_drive_version=data["proton_drive_version"],
             instance_id=data["instance_id"],
@@ -90,6 +102,25 @@ class Metadata:
             "metadata": self.metadata,
             "chunks": self.chunks,
         }
+
+
+_MIN_FOLDER_PARTS = 2  # a drive root plus at least one folder, e.g. /my-files/HomeAssistant
+
+
+def normalize_backup_folder(raw: str) -> Path | None:
+    """
+    Turn the folder typed in the config flow into a clean drive path: `/my-files//HA/` -> `/my-files/HA`.
+
+    None for relative paths, a bare drive root, `..` and names starting with `-` (the CLI would read such a name as
+    an option when it creates the folder).
+    """
+    text = raw.strip()
+    parts = [p for p in text.split("/") if p not in ("", ".")]
+    if not text.startswith("/") or len(parts) < _MIN_FOLDER_PARTS:
+        return None
+    if any(p == ".." or p.startswith("-") for p in parts):
+        return None
+    return Path("/" + "/".join(parts))
 
 
 def _upload_progress(size: int, on_progress: OnProgressCallback) -> Callable[[int], None]:
@@ -192,6 +223,24 @@ class ProtonDriveClient:
     async def download_backup(self, backup_id: str) -> AsyncIterator[bytes]:
         """Download a Home Assistant backup."""
         LOGGER.info("Downloading backup with ID: %s", backup_id)
+        files = await self.backup_files(backup_id)
+        async for chunk in self.stream_backup(files):
+            yield chunk
+        LOGGER.info("Finished downloading backup with ID: %s", backup_id)
+
+    async def stream_backup(self, files: list[str]) -> AsyncIterator[bytes]:
+        """Stream the given archive file(s) of a backup (from `backup_files`), downloading ahead."""
+        async with self.__temp_folder() as path:
+            async for chunk in self.__stream_files(path, files):
+                yield chunk
+
+    async def backup_files(self, backup_id: str) -> list[str]:
+        """
+        Names of the archive file(s) of a backup, in order.
+
+        Separate from the streaming so that a missing or broken backup is reported before the download starts
+        (raises ProtonDriveMissingBackupError / ProtonDriveInvalidBackupError).
+        """
         metadata_suffix = self.__make_metadata_filename("", backup_id)
 
         LOGGER.debug("Looking for metadata file with suffix: %s", metadata_suffix)
@@ -224,12 +273,7 @@ class ProtonDriveClient:
         else:
             files = [self.__make_chunk_filename(metadata.base_name, backup_id, i) for i in range(metadata.chunks)]
             LOGGER.debug("Downloading chunked (%d chunks) backup file", len(files))
-
-        async with self.__temp_folder() as path:
-            async for chunk in self.__stream_files(path, files):
-                yield chunk
-
-        LOGGER.info("Finished downloading backup with ID: %s", backup_id)
+        return files
 
     async def __stream_files(self, path: Path, files: list[str]) -> AsyncIterator[bytes]:
         tasks: dict[int, asyncio.Task[Path | CLIError]] = {}
@@ -345,12 +389,7 @@ class ProtonDriveClient:
                         on_io=on_io,
                     )
                 except NameConflictError:
-                    # A retry of our own timed-out-but-actually-completed attempt: our filenames
-                    # embed the backup_id, so a conflict on our own name means we already uploaded it.
-                    LOGGER.info(
-                        "Upload of %s already completed (name conflict on retry), treating as success",
-                        local_path.name,
-                    )
+                    await self.__verify_existing_upload(local_path)
 
             upload_start = time.monotonic()
             meta_task = asyncio.create_task(_upload(meta_path, ProtonCLI.METADATA_TIMEOUT_S))
@@ -358,6 +397,9 @@ class ProtonDriveClient:
                 _upload(archive_path, ProtonCLI.TRANSFER_TIMEOUT_S, _upload_progress(size, on_progress))
             )
             try:
+                # Cancelled (e.g. Home Assistant stops): gather cancels both uploads and each waits for its CLI
+                # process to exit before the temp folder goes away. Partial files left in the drive are skipped as
+                # orphans by list_backups and replaced by the next backup.
                 await asyncio.gather(meta_task, archive_task)
             except CLIError:
                 # asyncio.gather() does NOT cancel a still-running sibling when one task raises on its
@@ -406,10 +448,15 @@ class ProtonDriveClient:
         LOGGER.debug("Found metadata file: %s", metadata_file)
         LOGGER.debug("Found files to delete: %s", to_delete)
 
+        metadata: Metadata | dict = {}
         if metadata_file is None:
             LOGGER.warning("Metadata file not found for backup_id: %s", backup_id)
         else:
-            metadata = await self.__read_metadata(metadata_file)
+            try:
+                metadata = await self.__read_metadata(metadata_file)
+            except ProtonDriveInvalidBackupError:
+                # still delete what clearly belongs to this backup (matched by name above)
+                LOGGER.warning("Invalid metadata for backup_id %s, deleting only the matching files", backup_id)
             LOGGER.debug("Read metadata: %s", metadata)
             if isinstance(metadata, Metadata):
                 if metadata.chunks > 1:
@@ -461,6 +508,47 @@ class ProtonDriveClient:
 
         results = await asyncio.gather(*[_fetch(f) for f in live_metadata_files])
         return [r for r in results if r is not None]
+
+    async def get_backup(self, backup_id: str) -> AgentBackup | None:
+        """One backup by ID (reads only its own metadata), None if it does not exist or is incomplete."""
+        files = await self.__cli.list_files(self.__backup_folder)
+        suffix = self.__make_metadata_filename("", backup_id)
+        metadata_file = next((f for f in files if f.endswith(suffix)), None)
+        if metadata_file is None or not self.__has_matching_archive(metadata_file, files):
+            return None
+        metadata = await self.__read_metadata(metadata_file)
+        return AgentBackup.from_dict(metadata.metadata if isinstance(metadata, Metadata) else metadata)
+
+    async def __verify_existing_upload(self, local_path: Path) -> None:
+        """
+        Accept a name conflict on upload only for a complete file.
+
+        A retry after our own timed-out attempt: our filenames embed the backup_id, so the file is ours - but that
+        attempt may have stopped half-way. Raises CLIError (-> cleanup) if the remote file is not the full size.
+        """
+        expected = (await aiofiles.os.stat(local_path)).st_size
+        actual = await self.__remote_size(self.__make_filepath(local_path.name))
+        if actual != expected:
+            msg = (
+                f"{local_path.name} already exists in Proton Drive but is incomplete "
+                f"({actual} of {expected} bytes) after an interrupted attempt"
+            )
+            raise CLIError(msg)
+        LOGGER.info(
+            "Upload of %s already completed (name conflict on retry, size verified), treating as success",
+            local_path.name,
+        )
+
+    async def __remote_size(self, path: str) -> int | None:
+        """Size of a file in the drive (raw, from its active revision), None if unknown or not there."""
+        try:
+            info = await self.__cli.stat(path)
+        except CLIError:
+            return None
+        revision = getattr(info, "activeRevision", None)
+        revision = getattr(revision, "value", revision)  # some CLI versions wrap fields as {"ok", "value"}
+        size = getattr(revision, "claimedSize", None)
+        return size if isinstance(size, int) and not isinstance(size, bool) else None
 
     def __has_matching_archive(self, metadata_file: str, files: list[str]) -> bool:
         # Chunked backups store their archive as numbered `NN.tar.part` files instead of a
