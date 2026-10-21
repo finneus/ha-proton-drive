@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -17,7 +18,7 @@ from proton_drive.api import (
     _upload_progress,
     normalize_backup_folder,
 )
-from proton_drive.cli import CLIError, NameConflictError
+from proton_drive.cli import AuthError, CLIError, NameConflictError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -280,3 +281,51 @@ async def test_name_conflict_with_incomplete_file_fails_and_cleans_up(
     with pytest.raises(CLIError, match="incomplete"):
         await _upload(client, monkeypatch, data)
     assert cli.trashed  # partial files go to the trash
+
+
+class AuthCLI(FakeCLI):
+    """FakeCLI whose `get_email` fails until the CLI has run a command (which refreshes the session)."""
+
+    def __init__(self, *, refresh_works: bool) -> None:
+        """Configure whether a CLI call refreshes the access token."""
+        super().__init__([])
+        self.refresh_works = refresh_works
+        self.refreshed = False
+        self.calls: list[str] = []
+
+    async def get_email(self) -> str:
+        """Fail with 401 until refreshed."""
+        self.calls.append("get_email")
+        if not self.refreshed:
+            msg = "Authentication failed calling GET /core/v4/users: 401"
+            raise AuthError(msg)
+        return "me@proton.me"
+
+    async def list_files(self, _folder: Path, *, folders_only: bool = False) -> list[str]:  # noqa: ARG002
+        """Run a CLI command, which refreshes the session if possible."""
+        self.calls.append("list_files")
+        if not self.refresh_works:
+            msg = "You need to login first"
+            raise AuthError(msg)
+        self.refreshed = True
+        return []
+
+    async def exists(self, _path: object) -> bool:
+        """Report that the backup folder exists."""
+        return True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="drive paths like /my-files are only absolute on POSIX")
+async def test_expired_access_token_is_refreshed_by_the_cli_on_start(tmp_path: Path) -> None:
+    """After an HA restart the first direct API call failed with 401 although the session was still valid."""
+    cli = AuthCLI(refresh_works=True)
+    client = make_client(tmp_path, cli)
+    await client._ProtonDriveClient__prepare()
+    assert cli.calls == ["get_email", "list_files", "get_email"]
+
+
+async def test_real_logout_still_asks_for_a_new_login(tmp_path: Path) -> None:
+    cli = AuthCLI(refresh_works=False)
+    client = make_client(tmp_path, cli)
+    with pytest.raises(AuthError):
+        await client._ProtonDriveClient__prepare()

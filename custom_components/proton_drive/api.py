@@ -20,6 +20,7 @@ from homeassistant.components.backup import AgentBackup, OnProgressCallback
 from homeassistant.components.backup.util import suggested_filename
 
 from .cli import (
+    AuthError,
     CLIError,
     CLITimeoutError,
     NameConflictError,
@@ -196,7 +197,15 @@ class ProtonDriveClient:
         return me
 
     async def __prepare(self) -> None:
-        await self.__cli.get_email()
+        try:
+            await self.__cli.get_email()
+        except AuthError:
+            # The direct API call uses the access token from the CLI's session file, but only the CLI refreshes it.
+            # After a restart (only `version` ran so far) it can be expired although the session is fine: let the CLI
+            # make one harmless call to refresh it, then try again. If that fails too, a new login is really needed.
+            LOGGER.info("Access token rejected, letting the Proton Drive CLI refresh the session")
+            await self.__cli.list_files(Path("/"))
+            await self.__cli.get_email()
 
         if not self.__backup_folder.is_absolute() or len(self.__backup_folder.parts) < 2:  # noqa: PLR2004
             msg = f"Invalid backup folder '{self.__backup_folder}': must be a full path like /my-files/HomeAssistant"
