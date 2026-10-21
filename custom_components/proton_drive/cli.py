@@ -130,6 +130,44 @@ async def _proc_io(pid: int) -> tuple[int, int] | None:
         return None
 
 
+# Only what the CLI needs from Home Assistant's environment: locale, temp dir, proxies and TLS trust. Everything else
+# (e.g. SUPERVISOR_TOKEN on HAOS/Supervised, add-on secrets) stays out of the downloaded binary's reach.
+_PASSTHROUGH_ENV = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+)
+_HASH_BLOCK = 1024 * 1024
+
+
+def _cli_env(extra: dict[str, str]) -> dict[str, str]:
+    """Environment for the CLI binary: the allow-listed variables of this process plus `extra`."""
+    env = {key: os.environ[key] for key in _PASSTHROUGH_ENV if key in os.environ}
+    return {**env, **extra}
+
+
+def _sha512_file(path: Path) -> str:
+    """SHA-512 of a file, read block by block (the binary is ~100 MB; runs in an executor)."""
+    digest = hashlib.sha512()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(_HASH_BLOCK), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def stop_process(run: ProtonCLI._CLIRun) -> None:
     """Ask a still-running CLI process to exit (no-op once it is gone)."""
     if run.process.returncode is None:
@@ -224,7 +262,8 @@ class ProtonCLI:
         self.__xdg = hass.config.cache_path(DOMAIN, "xdg")
         self.__path = hass.config.cache_path(DOMAIN, "proton-drive")
         self.__integration_version = integration_version
-        self.__reap_tasks: set[asyncio.Task[None]] = set()
+        # timed-out runs whose process is still being terminated in the background
+        self.__reaping: dict[asyncio.Task[None], ProtonCLI._CLIRun] = {}
 
     @classmethod
     async def create(cls, hass: HomeAssistant) -> ProtonCLI:
@@ -235,8 +274,11 @@ class ProtonCLI:
         return me
 
     def aclose(self) -> None:
-        """Cancel this instance's own background bookkeeping."""
-        for task in self.__reap_tasks:
+        """Stop this instance's background work; CLI processes still being reaped are killed, not left behind."""
+        for task, run in list(self.__reaping.items()):
+            if run.process.returncode is None:
+                with suppress(ProcessLookupError):
+                    run.process.kill()
             task.cancel()
 
     async def __ainit(self, hass: HomeAssistant) -> None:
@@ -261,7 +303,11 @@ class ProtonCLI:
     @classmethod
     async def __get_platform(cls) -> tuple[str, str]:
         machine = platform.machine().lower()
-        is_musl = any(e.name.startswith("ld-musl-") for e in await aiofiles.os.scandir("/lib"))
+        try:
+            names = await aiofiles.os.listdir("/lib")
+        except OSError:
+            names = []  # no /lib (unusual container): assume glibc, the checksum still guards the download
+        is_musl = any(name.startswith("ld-musl-") for name in names)
         variant = "musl" if is_musl else "glibc"
         if machine in ("arm64", "aarch64"):
             arch = "arm64"
@@ -292,7 +338,6 @@ class ProtonCLI:
                 try:
                     async with aiofiles.open(tmp_path, "wb") as f:
                         async for chunk in resp.content.iter_chunked(cls.READ_CHUNK):
-                            LOGGER.debug("Writing %d bytes to %s", len(chunk), tmp_path)
                             await f.write(chunk)
                 except Exception as e:
                     if await aiofiles.ospath.exists(tmp_path):
@@ -343,10 +388,7 @@ class ProtonCLI:
             msg = f"No checksum available for architecture: {arch}"
             raise UnsupportedPlatformError(msg)
 
-        async with aiofiles.open(path, "rb") as f:
-            data = await f.read()
-
-        digest = hashlib.sha512(data).hexdigest()
+        digest = await asyncio.get_running_loop().run_in_executor(None, _sha512_file, path)
         if digest != expected:
             msg = f"Checksum mismatch for {path.name}, expected {expected}, got {digest}"
             raise DownloadCLIError(msg)
@@ -368,17 +410,18 @@ class ProtonCLI:
             proc = await asyncio.create_subprocess_exec(
                 self.__path,
                 *argv,
-                env={
-                    **os.environ,
-                    # Home Assistant has no OS keychain: keep the session in a plain file (read by __get_auth).
-                    # CLI < 0.9 used PROTON_DRIVE_UNSAFE_SECRETS, 0.9+ uses PROTON_DRIVE_CREDENTIALS_STORE
-                    # (keychain | pass | unsafe_file).
-                    "PROTON_DRIVE_UNSAFE_SECRETS": "true",
-                    "PROTON_DRIVE_CREDENTIALS_STORE": "unsafe_file",
-                    "XDG_CACHE_HOME": self.__xdg,
-                    "XDG_DATA_HOME": self.__xdg,
-                    "XDG_STATE_HOME": self.__xdg,
-                },
+                env=_cli_env(
+                    {
+                        # Home Assistant has no OS keychain: keep the session in a plain file (read by __get_auth).
+                        # CLI < 0.9 used PROTON_DRIVE_UNSAFE_SECRETS, 0.9+ uses PROTON_DRIVE_CREDENTIALS_STORE
+                        # (keychain | pass | unsafe_file).
+                        "PROTON_DRIVE_UNSAFE_SECRETS": "true",
+                        "PROTON_DRIVE_CREDENTIALS_STORE": "unsafe_file",
+                        "XDG_CACHE_HOME": self.__xdg,
+                        "XDG_DATA_HOME": self.__xdg,
+                        "XDG_STATE_HOME": self.__xdg,
+                    }
+                ),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -392,13 +435,17 @@ class ProtonCLI:
         # Give the CLI a chance to exit on its own terms first: a hard SIGKILL can catch it
         # mid-write to its own on-disk state (e.g. its events lock file), corrupting it and
         # breaking every subsequent invocation until that file is manually removed.
-        run.process.terminate()
+        if run.process.returncode is not None:
+            return
+        with suppress(ProcessLookupError):  # exited between the check and the signal
+            run.process.terminate()
         try:
             async with asyncio.timeout(self.TERMINATE_GRACE_S):
                 await run.process.wait()
         except TimeoutError:
             LOGGER.warning("[%s] Did not exit within %ss of SIGTERM, sending SIGKILL", run.id, self.TERMINATE_GRACE_S)
-            run.process.kill()
+            with suppress(ProcessLookupError):
+                run.process.kill()
             # awaiting wait() here can block as long as the timeout itself: https://github.com/python/cpython/issues/139373
             await run.process.wait()
         else:
@@ -427,11 +474,11 @@ class ProtonCLI:
                 LOGGER.debug("[%s] Progress callback failed", run.id, exc_info=True)
 
     def __kill_and_reap(self, run: _CLIRun) -> None:
-        # Fire-and-forget: used from the timeout-retry loop, where blocking here would delay
-        # the next attempt by up to TERMINATE_GRACE_S for no benefit.
+        # Fire-and-forget: used when a command finally timed out (no retry follows), so the caller gets its
+        # error without waiting up to TERMINATE_GRACE_S.
         reap_task = asyncio.create_task(self.__terminate(run))
-        self.__reap_tasks.add(reap_task)
-        reap_task.add_done_callback(self.__reap_tasks.discard)
+        self.__reaping[reap_task] = run
+        reap_task.add_done_callback(lambda task: self.__reaping.pop(task, None))
 
     async def __get_auth(self) -> tuple[str, str]:
         """Return the (uid, access token) pair."""
@@ -539,7 +586,8 @@ class ProtonCLI:
                         **({"json": body} if body is not None else {}),
                     )
                     data = await res.text()
-                    LOGGER.debug("[%s] API call response: %s %s %s", uid, res.status, res.headers, data)
+                    # status and size only: the body holds account data (e.g. the e-mail address)
+                    LOGGER.debug("[%s] API call response: %s (%d bytes)", uid, res.status, len(data))
                     res.raise_for_status()
                 return json.loads(data, object_hook=lambda d: SimpleNamespace(**d))
             except aiohttp.ClientResponseError as e:
@@ -582,10 +630,13 @@ class ProtonCLI:
                     async with asyncio.timeout(timeout_s):
                         stdout, stderr = await run.process.communicate()
                 except TimeoutError as e:
-                    self.__kill_and_reap(run)
                     if attempt >= retries:
+                        self.__kill_and_reap(run)
                         msg = f"[{run.id}] Command timed out after {timeout_s}s"
                         raise CLITimeoutError(msg) from e
+                    # Wait until the old process is really gone before retrying: a timed-out upload that is still
+                    # running would race the retry (and its leftover draft makes the retry report a name conflict).
+                    await self.__terminate(run)
                     attempt += 1
                     LOGGER.warning(
                         "[%s] Command timed out after %ss, retrying (%d/%d)", run.id, timeout_s, attempt, retries

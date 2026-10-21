@@ -11,6 +11,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.helpers.selector import SelectSelector, SelectSelectorConfig, SelectSelectorMode
 
+from .api import normalize_backup_folder
 from .cli import CLIError, CLIStartupError, ProtonCLI
 from .const import (
     CLI_VERSION,
@@ -205,9 +206,9 @@ class ProtonDriveFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         """Handle the backup folder step."""
         errors: dict[str, str] = {}
         if user_input is not None:
-            folder = Path(user_input[CONF_BACKUP_FOLDER].strip())
-            self.__backup_folder = str(folder)
-            if folder.is_absolute() and len(folder.parts) >= 2:  # noqa: PLR2004
+            folder = normalize_backup_folder(user_input[CONF_BACKUP_FOLDER])
+            self.__backup_folder = str(folder) if folder else user_input[CONF_BACKUP_FOLDER].strip()
+            if folder is not None:
                 return await self.__finish()
             errors[CONF_BACKUP_FOLDER] = "invalid_folder"
 
@@ -272,6 +273,7 @@ class ProtonDriveFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 }
             else:
                 entry = self._get_reauth_entry()
+                await self.__check_reauth_account(entry)
             self._abort_if_unique_id_mismatch()
             return self.async_update_reload_and_abort(
                 entry,
@@ -291,6 +293,27 @@ class ProtonDriveFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_BACKUP_FOLDER: self.__backup_folder,
             },
         )
+
+    async def __check_reauth_account(self, entry: config_entries.ConfigEntry) -> None:
+        """
+        Re-login with another Proton account: the CLI session is already switched, so aborting would not help.
+
+        Make it visible instead: rename the entry to the new account and warn that the backups now go there.
+        """
+        assert self.__cli is not None  # noqa: S101
+        try:
+            email = await self.__cli.get_email()
+        except CLIError:
+            LOGGER.warning("Failed to fetch user email after re-authentication")
+            return
+        if "@" in entry.title and email.lower() != entry.title.lower():
+            LOGGER.warning(
+                "Re-authenticated as %s instead of %s: new backups go to this account, backups in the old one are no "
+                "longer listed",
+                email,
+                entry.title,
+            )
+            self.hass.config_entries.async_update_entry(entry, title=email)
 
     def __async_create_task[T](self, coro: Coroutine[None, None, T]) -> _HASSTask[T]:
         return self._HASSTask(self.hass.async_create_task(coro))

@@ -23,6 +23,10 @@ def _install_fake_homeassistant() -> None:
     exceptions.ConfigEntryAuthFailed = type("ConfigEntryAuthFailed", (Exception,), {})
     exceptions.ConfigEntryError = type("ConfigEntryError", (Exception,), {})
     exceptions.ConfigEntryNotReady = type("ConfigEntryNotReady", (Exception,), {})
+    exceptions.HomeAssistantError = type("HomeAssistantError", (Exception,), {})
+
+    core = _new_module("homeassistant.core")
+    core.callback = lambda func: func
 
     helpers = _new_module("homeassistant.helpers")
     _new_module("homeassistant.helpers.instance_id")
@@ -38,6 +42,9 @@ def _install_fake_homeassistant() -> None:
     backup = _new_module("homeassistant.components.backup")
     backup.AgentBackup = type("AgentBackup", (), {})
     backup.OnProgressCallback = object
+    backup.BackupAgent = type("BackupAgent", (), {})
+    backup.BackupAgentError = type("BackupAgentError", (Exception,), {})
+    backup.BackupNotFound = type("BackupNotFound", (backup.BackupAgentError,), {})
     backup_util = _new_module("homeassistant.components.backup.util")
     backup_util.suggested_filename = lambda *_args, **_kwargs: ""
 
@@ -53,6 +60,7 @@ def _install_fake_homeassistant() -> None:
     hass_dict.HassKey = HassKey
 
     homeassistant.exceptions = exceptions
+    homeassistant.core = core
     homeassistant.helpers = helpers
     homeassistant.loader = loader
     homeassistant.components = components

@@ -1,6 +1,6 @@
 FROM ghcr.io/home-assistant/homeassistant-base:2026.07.0
 RUN apk add --no-cache make~4.4.1
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /usr/local/bin/uv
 RUN addgroup -S app && adduser -S -G app app
 WORKDIR /project
 RUN touch /.indocker

@@ -14,7 +14,7 @@ from homeassistant.components.backup import (
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 
-from .api import ProtonDriveError
+from .api import ProtonDriveError, ProtonDriveMissingBackupError
 from .cli import CLIError
 from .const import DOMAIN, LOGGER
 from .data import DATA_BACKUP_AGENT_LISTENERS, ProtonDriveConfigEntry
@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Coroutine
 
     from homeassistant.core import HomeAssistant
+
+_ERRORS = (ProtonDriveError, CLIError, HomeAssistantError, TimeoutError)
 
 
 async def async_get_backup_agents(
@@ -60,6 +62,9 @@ class ProtonDriveBackupAgent(BackupAgent):
     """Proton Drive backup agent."""
 
     domain = DOMAIN
+    # Agent ID "proton_drive.CLI". Home Assistant stores agent IDs in its backup settings (automatic backups):
+    # deriving it from the entry would silently drop Proton Drive from them. Safe as long as there is only one
+    # entry - the config flow enforces that (unique_id = DOMAIN, "already_configured").
     unique_id = "CLI"
 
     def __init__(self, config_entry: ProtonDriveConfigEntry) -> None:
@@ -80,11 +85,24 @@ class ProtonDriveBackupAgent(BackupAgent):
         :return: An async iterator that yields bytes.
         """
         LOGGER.debug("Downloading backup_id: %s", backup_id)
+        # Find the files first, so that a missing backup is BackupNotFound and other errors BackupAgentError right
+        # here - errors of the returned generator only show up while Home Assistant reads it.
         try:
-            # Do not await! We want to return it as-is so the caller can safely read the iterator
-            # otherwise the file will be deleted before the caller can read the data.
-            return self._client.download_backup(backup_id)
-        except (ProtonDriveError, CLIError, HomeAssistantError, TimeoutError) as err:
+            files = await self._client.backup_files(backup_id)
+        except ProtonDriveMissingBackupError as err:
+            msg = f"Backup {backup_id} not found"
+            raise BackupNotFound(msg) from err
+        except _ERRORS as err:
+            msg = f"Failed to download backup: {err}"
+            raise BackupAgentError(msg) from err
+        # Not awaited: the caller reads the stream, the temp files live as long as it does.
+        return self._stream(files)
+
+    async def _stream(self, files: list[str]) -> AsyncIterator[bytes]:
+        try:
+            async for chunk in self._client.stream_backup(files):
+                yield chunk
+        except _ERRORS as err:
             msg = f"Failed to download backup: {err}"
             raise BackupAgentError(msg) from err
 
@@ -145,9 +163,12 @@ class ProtonDriveBackupAgent(BackupAgent):
 
         Raises BackupNotFound if the backup does not exist.
         """
-        backups = await self.async_list_backups()
-        for backup in backups:
-            if backup.backup_id == backup_id:
-                return backup
-        msg = f"Backup {backup_id} not found"
-        raise BackupNotFound(msg)
+        try:
+            backup = await self._client.get_backup(backup_id)
+        except _ERRORS as err:
+            msg = f"Failed to get backup: {err}"
+            raise BackupAgentError(msg) from err
+        if backup is None:
+            msg = f"Backup {backup_id} not found"
+            raise BackupNotFound(msg)
+        return backup
